@@ -1,269 +1,250 @@
 #!/usr/bin/env python3
 """
-Stock Data Scraper for StockAnalysis.com
-Scrapes historical stock data and can modify date ranges
+Stock Data Scraper using Yahoo Finance
+Gets 1 year of historical data for multiple stocks
 """
 
-import requests
-from bs4 import BeautifulSoup
+import yfinance as yf
 import pandas as pd
 import time
-import json
-from urllib.parse import urljoin, urlparse, parse_qs
-import re
-import urllib.parse
+import os
+from datetime import datetime
 
-class StockAnalysisScraper:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        })
+class StockDataScraper:
+    def __init__(self, output_dir="csv_files"):
+        self.output_dir = output_dir
+        # Create output directory if it doesn't exist
+        os.makedirs(self.output_dir, exist_ok=True)
+    
+    def load_symbols_from_file(self, filename="stock_symbols.txt"):
+        """
+        Load stock symbols from a text file
+        
+        Args:
+            filename (str): Path to file containing stock symbols
+            
+        Returns:
+            list: List of stock symbols
+        """
+        symbols = []
+        
+        try:
+            with open(filename, 'r') as file:
+                for line in file:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if line and not line.startswith('#'):
+                        symbols.append(line.upper())
+            
+            print(f"Loaded {len(symbols)} symbols from {filename}: {', '.join(symbols)}")
+            return symbols
+            
+        except FileNotFoundError:
+            print(f"Error: Could not find {filename}")
+            return []
+        except Exception as e:
+            print(f"Error reading {filename}: {e}")
+            return []
         
     def get_stock_data(self, symbol, period='1y'):
         """
-        Get historical stock data for a given symbol
+        Get historical stock data for a given symbol using yfinance
         
         Args:
             symbol (str): Stock symbol (e.g., 'A', 'AAPL')
-            period (str): Time period - '1y' for 1 year, '6m' for 6 months, 'daily' for daily
+            period (str): Time period - '1y', '6mo', '3mo', '2y', '5y', 'max'
             
         Returns:
             pandas.DataFrame: Historical stock data
         """
-        base_url = f"https://stockanalysis.com/stocks/{symbol.lower()}/history/"
-        
         try:
-            print(f"Fetching data for {symbol} with period {period}...")
+            print(f"Fetching Yahoo Finance data for {symbol} ({period})...")
             
-            # First, get the initial page to understand the structure
-            response = self.session.get(base_url)
-            response.raise_for_status()
+            # Create ticker object
+            ticker = yf.Ticker(symbol)
             
-            soup = BeautifulSoup(response.content, 'html.parser')
+            # Get historical data
+            hist = ticker.history(period=period)
             
-            # Try to find and interact with date range buttons
-            updated_url = self._handle_date_range_selection(soup, base_url, period)
-            
-            # Get the page with the selected date range
-            if updated_url != base_url:
-                print(f"Fetching data with updated URL: {updated_url}")
-                response = self.session.get(updated_url)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Look for the historical data table
-            table = self._find_data_table(soup)
-            
-            if table is None:
-                print("Could not find historical data table")
+            if hist.empty:
+                print(f"  No data returned for {symbol}")
                 return None
-                
-            # Extract data from the table
-            data = self._extract_table_data(table)
-            
-            if not data:
-                print("No data extracted from table")
-                return None
-                
-            # Convert to DataFrame
-            df = pd.DataFrame(data)
             
             # Clean and format the data
-            df = self._clean_data(df)
+            df = self._clean_data(hist)
             
-            print(f"Successfully extracted {len(df)} rows of data")
+            # Calculate date range
+            if not df.empty and 'Date' in df.columns:
+                try:
+                    min_date = pd.to_datetime(df['Date']).min()
+                    max_date = pd.to_datetime(df['Date']).max()
+                    date_range = max_date - min_date
+                    days = date_range.days
+                    print(f"  Successfully retrieved {len(df)} rows spanning {days} days ({days/365:.1f} years)")
+                    print(f"  Date range: {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+                except:
+                    print(f"  Successfully retrieved {len(df)} rows")
+            else:
+                print(f"  Successfully retrieved {len(df)} rows")
+            
             return df
             
-        except requests.RequestException as e:
-            print(f"Error fetching data: {e}")
-            return None
         except Exception as e:
-            print(f"Unexpected error: {e}")
+            print(f"  Error fetching data for {symbol}: {e}")
             return None
-    
-    def _handle_date_range_selection(self, soup, base_url, period):
-        """
-        Handle date range selection by finding the appropriate URL or parameters
-        
-        Args:
-            soup: BeautifulSoup object of the page
-            base_url: Base URL for the stock history page
-            period: Desired period ('1y', '6m', 'daily')
-            
-        Returns:
-            str: Updated URL with the selected period
-        """
-        # Look for buttons or links that control the date range
-        # Common patterns: buttons with data attributes, links with query parameters
-        
-        # Method 1: Look for buttons with specific text or data attributes
-        buttons = soup.find_all(['button', 'a'], string=re.compile(r'1\s*year|1\s*y|year', re.I))
-        if buttons:
-            for button in buttons:
-                if 'href' in button.attrs:
-                    return urljoin(base_url, button['href'])
-                elif 'data-url' in button.attrs:
-                    return urljoin(base_url, button['data-url'])
-        
-        # Method 2: Look for JavaScript functions or API endpoints
-        scripts = soup.find_all('script')
-        for script in scripts:
-            if script.string:
-                # Look for API endpoints or URL patterns
-                api_matches = re.findall(r'["\']([^"\']*api[^"\']*history[^"\']*)["\']', script.string)
-                if api_matches:
-                    api_url = api_matches[0]
-                    if not api_url.startswith('http'):
-                        api_url = urljoin(base_url, api_url)
-                    
-                    # Try to modify the API URL for different periods
-                    if period == '1y':
-                        # Common patterns for 1 year: ?period=1y, ?range=1y, ?timeframe=1y
-                        if '?' in api_url:
-                            api_url += f"&period=1y"
-                        else:
-                            api_url += f"?period=1y"
-                        return api_url
-        
-        # Method 3: Try common URL patterns for different periods
-        if period == '1y':
-            # Try different common patterns
-            patterns = [
-                f"{base_url}?period=1y",
-                f"{base_url}?range=1y", 
-                f"{base_url}?timeframe=1y",
-                f"{base_url}?period=1Y",
-                f"{base_url}?range=1Y",
-                f"{base_url}?timeframe=1Y"
-            ]
-            
-            # Test which pattern works by making a quick request
-            for pattern in patterns:
-                try:
-                    test_response = self.session.head(pattern)
-                    if test_response.status_code == 200:
-                        return pattern
-                except:
-                    continue
-        
-        # If no specific period handling found, return original URL
-        return base_url
-    
-    def _find_data_table(self, soup):
-        """Find the historical data table in the HTML"""
-        # Look for tables with historical data
-        tables = soup.find_all('table')
-        
-        for table in tables:
-            # Check if this looks like a historical data table
-            headers = table.find_all('th')
-            if headers:
-                header_text = ' '.join([th.get_text().strip() for th in headers])
-                if any(word in header_text.lower() for word in ['date', 'open', 'high', 'low', 'close']):
-                    return table
-        
-        # Alternative: look for specific div or section containing the table
-        historical_section = soup.find('h2', string=re.compile(r'Historical Data', re.I))
-        if historical_section:
-            # Look for table in the same section or nearby
-            parent = historical_section.parent
-            while parent and parent.name != 'body':
-                table = parent.find('table')
-                if table:
-                    return table
-                parent = parent.parent
-        
-        return None
-    
-    def _extract_table_data(self, table):
-        """Extract data from the HTML table"""
-        data = []
-        rows = table.find_all('tr')
-        
-        if not rows:
-            return data
-            
-        # Get headers
-        headers = []
-        header_row = rows[0]
-        for th in header_row.find_all(['th', 'td']):
-            headers.append(th.get_text().strip())
-        
-        # Extract data rows
-        for row in rows[1:]:
-            cells = row.find_all(['td', 'th'])
-            if len(cells) >= len(headers):
-                row_data = {}
-                for i, cell in enumerate(cells):
-                    if i < len(headers):
-                        row_data[headers[i]] = cell.get_text().strip()
-                data.append(row_data)
-        
-        return data
     
     def _clean_data(self, df):
-        """Clean and format the extracted data"""
+        """Clean and format Yahoo Finance data"""
         if df.empty:
             return df
-            
-        # Clean column names
-        df.columns = [col.strip() for col in df.columns]
         
-        # Convert date column
+        # Reset index to make Date a column
+        df = df.reset_index()
+        
+        # Ensure Date column exists and is properly formatted
         if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df['Date'] = pd.to_datetime(df['Date']).dt.date
         
-        # Convert numeric columns
-        numeric_columns = ['Open', 'High', 'Low', 'Close', 'Adj. Close', 'Volume']
+        # Round numeric columns to reasonable precision
+        numeric_columns = ['Open', 'High', 'Low', 'Close']
         for col in numeric_columns:
             if col in df.columns:
-                # Remove commas and convert to numeric
-                df[col] = df[col].str.replace(',', '').str.replace('$', '')
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # Handle percentage change column
-        if 'Change' in df.columns:
-            df['Change'] = df['Change'].str.replace('%', '')
-            df['Change'] = pd.to_numeric(df['Change'], errors='coerce')
+                df[col] = df[col].round(2)
         
         # Sort by date (newest first)
-        if 'Date' in df.columns:
-            df = df.sort_values('Date', ascending=False)
+        df = df.sort_values('Date', ascending=False)
+        
+        # Reset index
+        df = df.reset_index(drop=True)
         
         return df
     
+    def get_multiple_stocks_data(self, symbols, period='1y', delay=1.0):
+        """
+        Get historical stock data for multiple symbols
+        
+        Args:
+            symbols (list): List of stock symbols (e.g., ['A', 'AAPL', 'GOOGL'])
+            period (str): Time period - '1y', '6mo', '3mo', '2y', '5y', 'max'
+            delay (float): Delay between requests in seconds (default 1.0)
+            
+        Returns:
+            dict: Dictionary with symbol as key and DataFrame as value
+        """
+        results = {}
+        failed_symbols = []
+        
+        print(f"Fetching Yahoo Finance data for {len(symbols)} symbols: {', '.join(symbols)}")
+        
+        for i, symbol in enumerate(symbols, 1):
+            print(f"\n[{i}/{len(symbols)}] Processing {symbol}...")
+            
+            try:
+                df = self.get_stock_data(symbol, period)
+                if df is not None and not df.empty:
+                    results[symbol] = df
+                    print(f"✓ Successfully retrieved {len(df)} rows for {symbol}")
+                else:
+                    failed_symbols.append(symbol)
+                    print(f"✗ No data retrieved for {symbol}")
+                    
+            except Exception as e:
+                failed_symbols.append(symbol)
+                print(f"✗ Error processing {symbol}: {e}")
+            
+            # Add delay between requests to be respectful
+            if i < len(symbols):
+                time.sleep(delay)
+        
+        # Summary
+        print(f"\n--- Summary ---")
+        print(f"Successfully processed: {len(results)} symbols")
+        if failed_symbols:
+            print(f"Failed to process: {len(failed_symbols)} symbols ({', '.join(failed_symbols)})")
+        
+        return results
+    
     def save_to_csv(self, df, symbol, filename=None):
-        """Save DataFrame to CSV file"""
+        """Save DataFrame to CSV file in the output directory"""
         if filename is None:
             filename = f"{symbol}_historical_data.csv"
         
-        df.to_csv(filename, index=False)
-        print(f"Data saved to {filename}")
-        return filename
+        # Create full path in output directory
+        filepath = os.path.join(self.output_dir, filename)
+        
+        df.to_csv(filepath, index=False)
+        print(f"Data saved to {filepath}")
+        return filepath
+    
+    def save_multiple_to_csv(self, stock_data_dict, individual_files=True, combined_file=None):
+        """
+        Save multiple stock data to CSV files
+        
+        Args:
+            stock_data_dict (dict): Dictionary with symbol as key and DataFrame as value
+            individual_files (bool): Save individual CSV files for each stock
+            combined_file (str): Optional filename for combined CSV file
+            
+        Returns:
+            list: List of saved filenames
+        """
+        saved_files = []
+        
+        # Save individual files
+        if individual_files:
+            for symbol, df in stock_data_dict.items():
+                filename = self.save_to_csv(df, symbol)
+                saved_files.append(filename)
+        
+        # Save combined file
+        if combined_file:
+            combined_data = []
+            for symbol, df in stock_data_dict.items():
+                df_copy = df.copy()
+                df_copy['Symbol'] = symbol
+                combined_data.append(df_copy)
+            
+            if combined_data:
+                combined_df = pd.concat(combined_data, ignore_index=True)
+                # Sort by symbol and then by date
+                combined_df = combined_df.sort_values(['Symbol', 'Date'], ascending=[True, False])
+                
+                # Create full path in output directory
+                combined_filepath = os.path.join(self.output_dir, combined_file)
+                combined_df.to_csv(combined_filepath, index=False)
+                print(f"Combined data saved to {combined_filepath}")
+                saved_files.append(combined_filepath)
+        
+        return saved_files
 
 def main():
-    """Main function to demonstrate usage"""
-    scraper = StockAnalysisScraper()
+    """Example usage of the Yahoo Finance scraper"""
+    scraper = StockDataScraper()
     
-    # Example: Get data for Agilent Technologies (A)
-    symbol = "A"
-    df = scraper.get_stock_data(symbol)
+    # Load stock symbols from file
+    symbols = scraper.load_symbols_from_file("stock_symbols.txt")
     
-    if df is not None:
-        print("\nFirst 5 rows of data:")
-        print(df.head())
+    if not symbols:
+        print("No symbols loaded. Please check stock_symbols.txt file.")
+        return
+    
+    print(f"Fetching 1 year of data for {len(symbols)} stocks...")
+    stock_data = scraper.get_multiple_stocks_data(symbols, period='1y')
+    
+    if stock_data:
+        print(f"\n=== Results ===")
+        for symbol, df in stock_data.items():
+            if not df.empty:
+                print(f"{symbol}: {len(df)} rows")
+            
+        # Save individual files
+        scraper.save_multiple_to_csv(stock_data, individual_files=True)
         
-        print(f"\nData shape: {df.shape}")
-        print(f"Columns: {list(df.columns)}")
+        # Save combined file
+        scraper.save_multiple_to_csv(stock_data, individual_files=False, combined_file="portfolio_1year.csv")
         
-        # Save to CSV
-        scraper.save_to_csv(df, symbol)
+        print(f"\n✅ Successfully retrieved 1 year of data for {len(stock_data)} stocks!")
+        print(f"Files saved to: {scraper.output_dir}/ directory")
     else:
         print("Failed to retrieve data")
 
